@@ -2,6 +2,7 @@
 """ARK Telegram Bot —— 支持每天 12:00 / 00:00 定时推送"""
 import os, sys, time, json, threading, datetime
 from pathlib import Path
+import http.server
 
 import requests
 from requests.exceptions import ReadTimeout, RequestException
@@ -186,7 +187,25 @@ def monitor_loop():
         time.sleep(POLL_INTERVAL)
 
 
+def health_server():
+    """假网站端口，让 Fly.io 认为服务健康，不会被自动停"""
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *a):
+            pass
+    try:
+        srv = http.server.HTTPServer(("0.0.0.0", 8080), H)
+        srv.serve_forever()
+    except Exception as e:
+        print("[health err]", e, flush=True)
+
+
 def main():
+    threading.Thread(target=health_server, daemon=True).start()
     call("deleteWebhook", {"drop_pending_updates": False})
     me = call("getMe")
     print(f"Bot @{me['username']} started", flush=True)

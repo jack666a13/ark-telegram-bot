@@ -12,3 +12,12 @@ primary_region = "ams"
 [[vm]]
   size = "shared-cpu-1x"
   memory = "256mb"
+
+# 声明为 http 服务，避免被平台判定为"无服务"而自动停止
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
