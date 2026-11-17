@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ARK Telegram Bot"""
+"""ARK Telegram Bot —— 支持每天 12:00 / 00:00 定时推送"""
 import os, sys, time, json, threading, datetime
 from pathlib import Path
 
@@ -15,21 +15,39 @@ BASE = f"https://api.telegram.org/bot{TOKEN}"
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "10"))
 STATE_PATH = Path(os.environ.get("STATE_PATH", "/tmp/ark_bot_state.json"))
 
+# 固定推送对象（你 + 群 + 4位），环境变量可覆盖
+DEFAULT_SUBS = "6181300497,-5567259487,810215667,8081808952,8099061382,8239955906"
+
 RPC_LIST = [
     "https://bsc-dataseed.bnbchain.org",
     "https://bsc-dataseed1.defibit.io",
     "https://bsc-dataseed1.ninicoin.io",
 ]
 RV = "0x8366a748E02F730911Cb5AB4fd049d2E1e0414b7"
+LP = "0xCAaF3c41a40103a23Eeaa4BbA468AF3cF5b0e0D8"
 SEL = "0xc3f909d4"
+SEL_RESERVES = "0x0902f1ac"
 DASHBOARD = os.environ.get("DASHBOARD_URL", "https://aquamarine-kitten-94e7d3.netlify.app")
+
+TZ8 = datetime.timezone(datetime.timedelta(hours=8))
 
 
 def load_subs():
+    """订阅者 = 文件里存的 + 环境变量里固定的"""
+    subs = set()
+    for s in os.environ.get("BROADCAST_IDS", DEFAULT_SUBS).split(","):
+        s = s.strip()
+        if s:
+            try:
+                subs.add(int(s))
+            except ValueError:
+                pass
     try:
-        return set(json.loads(STATE_PATH.read_text()))
+        for x in json.loads(STATE_PATH.read_text()):
+            subs.add(int(x))
     except Exception:
-        return set()
+        pass
+    return subs
 
 
 def save_subs(s):
@@ -56,22 +74,37 @@ def send(chat_id, text):
         print("[send err]", e, flush=True)
 
 
-def read_config():
+def rpc_call(data):
     last = None
     for rpc in RPC_LIST:
         try:
             p = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                 "params": [{"to": RV, "data": SEL}, "latest"]}
+                 "params": [{"to": data["to"], "data": data["sel"]}, "latest"]}
             r = requests.post(rpc, json=p, timeout=20)
-            raw = r.json()["result"][2:]
-            w = [raw[i:i + 64] for i in range(0, len(raw), 64)]
-            v = [int(x, 16) for x in w[:6]]
-            return {"minRatio": v[4] / 1e4, "maxRatio": v[5] / 1e4,
-                    "totalVestingAmount": str(v[1]), "totalClaimAmount": str(v[2]),
-                    "globalMaxClaimAllowanceLimit": str(v[3])}
+            return r.json()["result"]
         except Exception as e:
             last = e
     raise last or RuntimeError("all rpc failed")
+
+
+def read_config():
+    raw = rpc_call({"to": RV, "sel": SEL})[2:]
+    w = [raw[i:i + 64] for i in range(0, len(raw), 64)]
+    v = [int(x, 16) for x in w[:6]]
+    return {"minRatio": v[4] / 1e4, "maxRatio": v[5] / 1e4,
+            "totalVestingAmount": str(v[1]), "totalClaimAmount": str(v[2]),
+            "globalMaxClaimAllowanceLimit": str(v[3])}
+
+
+def ark_price():
+    try:
+        raw = rpc_call({"to": LP, "sel": SEL_RESERVES})[2:]
+        w = [raw[i:i + 64] for i in range(0, len(raw), 64)]
+        r0 = int(w[0], 16) / 1e18
+        r1 = int(w[1], 16) / 1e18
+        return r0 / r1 if r1 > 0 else None
+    except Exception:
+        return None
 
 
 def f(x):
@@ -87,6 +120,20 @@ def now_text(rec):
             f"dashboard: {DASHBOARD}")
 
 
+def coef_text(rec):
+    """标准 4 行推送格式"""
+    if not rec:
+        return "ARK 系數暫時讀不到"
+    Y = rec["minRatio"]
+    pr = 0.78 * Y - 0.02
+    p = ark_price()
+    usd = f"${pr * 100 * p:,.0f}" if p else "$—"
+    return ("🔔 ARK 渦輪系數\n\n"
+            f"Y：{Y:.4f} （{rec['minRatio']:.4f} ~ {rec['maxRatio']:.4f}）\n\n"
+            f"到手比例：{pr*100:.2f}%\n\n"
+            f"100 ARK 到手：{pr*100:.2f} · 折算 {usd}")
+
+
 HELP = ("ARK Turbine Monitor\n"
         "Commands:\n"
         "/now - current\n"
@@ -98,26 +145,42 @@ HELP = ("ARK Turbine Monitor\n"
 LAST = {"rec": None, "min": None, "max": None}
 
 
+def broadcast_all(rec):
+    for cid in list(SUBS):
+        send(cid, coef_text(rec))
+
+
 def monitor_loop():
+    last_noon = None
+    last_midnight = None
     while True:
         try:
             rec = read_config()
             LAST["rec"] = rec
             mn, mx = rec["minRatio"], rec["maxRatio"]
+
+            # 规则1：系数变化
             if LAST["min"] is None:
                 LAST["min"], LAST["max"] = mn, mx
             elif mn != LAST["min"] or mx != LAST["max"]:
-                msg = "ARK Coefficient Changed!\n"
-                if mn != LAST["min"]:
-                    msg += f"min: {f(LAST['min'])} -> {f(mn)}\n"
-                if mx != LAST["max"]:
-                    msg += f"max: {f(LAST['max'])} -> {f(mx)}\n"
-                ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                msg += f"time: {ts}"
                 print("[change]", LAST["min"], "->", mn, flush=True)
-                for cid in list(SUBS):
-                    send(cid, msg)
+                broadcast_all(rec)
                 LAST["min"], LAST["max"] = mn, mx
+
+            # 规则2：每日 12:00 / 00:00（北京时间）
+            now = datetime.datetime.now(TZ8)
+            today = now.strftime("%Y-%m-%d")
+            hhmm = now.hour * 60 + now.minute
+
+            if 12 * 60 <= hhmm <= 12 * 60 + 30 and last_noon != today:
+                print("[daily 12:00]", today, flush=True)
+                broadcast_all(rec)
+                last_noon = today
+
+            if hhmm <= 30 and last_midnight != today:
+                print("[daily 00:00]", today, flush=True)
+                broadcast_all(rec)
+                last_midnight = today
         except Exception as e:
             print("[monitor err]", e, flush=True)
         time.sleep(POLL_INTERVAL)
@@ -127,7 +190,9 @@ def main():
     call("deleteWebhook", {"drop_pending_updates": False})
     me = call("getMe")
     print(f"Bot @{me['username']} started", flush=True)
+    print(f"subs: {sorted(SUBS)}", flush=True)
     threading.Thread(target=monitor_loop, daemon=True).start()
+
     offset = None
     while True:
         try:
