@@ -1,0 +1,14 @@
+app = "ark-telegram-bot"
+primary_region = "ams"
+
+[build]
+
+[env]
+  POLL_INTERVAL = "10"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[processes]
+  app = "python3 bot.py"
